@@ -1,0 +1,6 @@
+addr: ":9090"
+
+dbs:
+  - path: /data/db
+    upstream:
+      url: http://${PRIMARY_REGION}.litestream-read-replica-demo.internal:9090
