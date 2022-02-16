@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -20,6 +21,11 @@ var (
 
 //go:embed index.html main.js
 var fs embed.FS
+
+var notify struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
 
 func main() {
 	if err := run(context.Background()); err != nil {
@@ -46,14 +52,101 @@ func run(ctx context.Context) error {
 
 	log.Printf("listening on %s", *addr)
 
-	http.Handle("/", http.FileServer(http.FS(fs)))
-	return http.ListenAndServe(*addr, nil)
+	return http.ListenAndServe(*addr, &handler{db: db})
+}
+
+type handler struct {
+	db *sql.DB
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("region")
+
+	// Redirect to primary if this is a write request.
+	if r.Method != "GET" && !isPrimary() {
+		w.Header().Set("fly-replay", fmt.Sprintf("region:"+primaryRegion()))
+		return
+	}
+
+	// Otherwise, redirect to specified region.
+	region := r.URL.Query().Get("region")
+	if region != "" && region != currentRegion() {
+		w.Header().Set("fly-replay", fmt.Sprintf("region:"+currentRegion()))
+		return
+	}
+
+	switch r.URL.Path {
+	case "/stream":
+		h.handleStream(w, r)
+	default:
+		http.FileServer(http.FS(fs)).ServeHTTP(w, r)
+	}
+}
+
+func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
+	log.Printf("stream connected %p", r)
+	defer log.Printf("stream disconnected %p", r)
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/event-stream")
+
+	if _, err := fmt.Fprintf(w, "event: init\n\n"); err != nil {
+		log.Printf("cannot write init event: %s", err)
+		return
+	}
+	w.(http.Flusher).Flush()
+
+	notify.mu.Lock()
+	notifyCh := notify.ch
+	notify.mu.Unlock()
+
+	for {
+		// Query from database.
+		var n int
+		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+			log.Printf("cannot query: %s", err)
+			return
+		}
+
+		// Marshal data & write SSE message.
+		if _, err := fmt.Fprintf(w, "event: update\ndata: %d\n\n"); err != nil {
+			log.Printf("cannot write update event: %s", err)
+			return
+		}
+		w.(http.Flusher).Flush()
+
+		select {
+		case <-r.Context().Done():
+			return
+		case <-notifyCh:
+		}
+
+		notify.mu.Lock()
+		notifyCh = notify.ch
+		notify.mu.Unlock()
+	}
+}
+
+// currentRegion returns the fly.io region. If unset, returns "local".
+func currentRegion() string {
+	if v := os.Getenv("FLY_REGION"); v != "" {
+		return v
+	}
+	return "local"
+}
+
+// primaryRegion returns the primary region. If unset, returns "local".
+func primaryRegion() string {
+	if v := os.Getenv("PRIMARY_REGION"); v != "" {
+		return v
+	}
+	return "local"
 }
 
 // isPrimary returns true if primary region matches the fly.io region or if primary is unset.
 func isPrimary() bool {
-	switch os.Getenv("PRIMARY_REGION") {
-	case "", os.Getenv("FLY_REGION"):
+	switch primaryRegion() {
+	case "", currentRegion():
 		return true
 	default:
 		return false
