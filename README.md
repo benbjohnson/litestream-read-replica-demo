@@ -19,3 +19,4 @@ fly volumes create --region sjc --size 1 data
 fly volumes create --region ams --size 1 data
 fly volumes create --region nrt --size 1 data
 ```
+

@@ -3,14 +3,15 @@ package main
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -19,12 +20,21 @@ var (
 	addr = flag.String("addr", ":8080", "bind address")
 )
 
-//go:embed index.html main.js
-var fs embed.FS
-
 var notify struct {
 	mu sync.Mutex
 	ch chan struct{}
+
+	value   int
+	latency time.Duration
+}
+
+var primaryRegion = "ord"
+
+var regions = []*Region{
+	{Code: "ord", Primary: true},
+	{Code: "sjc"},
+	{Code: "ams"},
+	{Code: "nrt"},
 }
 
 func main() {
@@ -40,6 +50,14 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("flag required: -dsn DSN")
 	}
 
+	notify.ch = make(chan struct{})
+
+	// Default region to primary if not specified.
+	if os.Getenv("FLY_REGION") == "" {
+		os.Setenv("FLY_REGION", primaryRegion)
+	}
+
+	log.Printf("region: %s", os.Getenv("FLY_REGION"))
 	log.Printf("opening database: %s", *dsn)
 
 	db, err := sql.Open("sqlite3", *dsn)
@@ -47,108 +65,92 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("open database: %w", err)
 	} else if _, err := db.Exec(`PRAGMA journal_mode = wal`); err != nil {
 		return fmt.Errorf("set journal mode: %w", err)
+	} else if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, value INTEGER, timestamp TEXT)`); err != nil {
+		return fmt.Errorf("set journal mode: %w", err)
+	} else if _, err := db.Exec(`INSERT INTO t (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
+		return fmt.Errorf("set journal mode: %w", err)
 	}
 	defer db.Close()
+
+	// Monitor database file for changes.
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("file watcher: %w", err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(*dsn); err != nil {
+		return fmt.Errorf("watch db file: %w", err)
+	} else if err := watcher.Add(*dsn + "-wal"); err != nil {
+		return fmt.Errorf("watch wal file: %w", err)
+	}
+
+	go func() {
+		if err := monitor(ctx, db, watcher); err != nil {
+			log.Fatalf("watcher: %s", err)
+		}
+	}()
 
 	log.Printf("listening on %s", *addr)
 
 	return http.ListenAndServe(*addr, &handler{db: db})
 }
 
-type handler struct {
-	db *sql.DB
-}
-
-func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("region")
-
-	// Redirect to primary if this is a write request.
-	if r.Method != "GET" && !isPrimary() {
-		w.Header().Set("fly-replay", fmt.Sprintf("region:"+primaryRegion()))
-		return
-	}
-
-	// Otherwise, redirect to specified region.
-	region := r.URL.Query().Get("region")
-	if region != "" && region != currentRegion() {
-		w.Header().Set("fly-replay", fmt.Sprintf("region:"+currentRegion()))
-		return
-	}
-
-	switch r.URL.Path {
-	case "/stream":
-		h.handleStream(w, r)
-	default:
-		http.FileServer(http.FS(fs)).ServeHTTP(w, r)
-	}
-}
-
-func (h *handler) handleStream(w http.ResponseWriter, r *http.Request) {
-	log.Printf("stream connected %p", r)
-	defer log.Printf("stream disconnected %p", r)
-
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "text/event-stream")
-
-	if _, err := fmt.Fprintf(w, "event: init\n\n"); err != nil {
-		log.Printf("cannot write init event: %s", err)
-		return
-	}
-	w.(http.Flusher).Flush()
-
-	notify.mu.Lock()
-	notifyCh := notify.ch
-	notify.mu.Unlock()
-
+// monitor runs in a separate goroutine and monitors the main DB & WAL file.
+func monitor(ctx context.Context, db *sql.DB, watcher *fsnotify.Watcher) error {
 	for {
-		// Query from database.
-		var n int
-		if err := h.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
-			log.Printf("cannot query: %s", err)
-			return
-		}
-
-		// Marshal data & write SSE message.
-		if _, err := fmt.Fprintf(w, "event: update\ndata: %d\n\n"); err != nil {
-			log.Printf("cannot write update event: %s", err)
-			return
-		}
-		w.(http.Flusher).Flush()
-
 		select {
-		case <-r.Context().Done():
-			return
-		case <-notifyCh:
+		case event := <-watcher.Events:
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				log.Printf("database file modified: %s", event.Name)
+				if err := readDB(ctx, db); err != nil {
+					log.Printf("read db: %s", err)
+				}
+			}
+		case err := <-watcher.Errors:
+			return err
 		}
-
-		notify.mu.Lock()
-		notifyCh = notify.ch
-		notify.mu.Unlock()
 	}
 }
 
-// currentRegion returns the fly.io region. If unset, returns "local".
-func currentRegion() string {
-	if v := os.Getenv("FLY_REGION"); v != "" {
-		return v
+func readDB(ctx context.Context, db *sql.DB) error {
+	notify.mu.Lock()
+	defer notify.mu.Unlock()
+
+	var value int
+	var timestamp string
+	if err := db.QueryRowContext(ctx, `SELECT value, timestamp FROM t WHERE id = 1`).Scan(&value, &timestamp); err != nil {
+		return fmt.Errorf("query: %w", err)
 	}
-	return "local"
+
+	// Ignore if the value is the same.
+	if notify.value == value {
+		return nil
+	}
+
+	notify.value = value
+
+	if timestamp != "" {
+		t, err := time.Parse(time.RFC3339Nano, timestamp)
+		if err != nil {
+			return fmt.Errorf("parse timestamp: %w", err)
+		}
+		notify.latency = time.Since(t)
+	} else {
+		notify.latency = 0
+	}
+
+	// Record latency
+	log.Printf("update: value=%d latency=%s", notify.value, notify.latency)
+
+	// Notify watchers.
+	close(notify.ch)
+	notify.ch = make(chan struct{})
+
+	return nil
 }
 
-// primaryRegion returns the primary region. If unset, returns "local".
-func primaryRegion() string {
-	if v := os.Getenv("PRIMARY_REGION"); v != "" {
-		return v
-	}
-	return "local"
-}
-
-// isPrimary returns true if primary region matches the fly.io region or if primary is unset.
-func isPrimary() bool {
-	switch primaryRegion() {
-	case "", currentRegion():
-		return true
-	default:
-		return false
-	}
+type Region struct {
+	Code    string `json:"code"`
+	Primary bool   `json:"primary"`
 }
