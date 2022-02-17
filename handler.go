@@ -25,14 +25,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Redirect to primary if this is a write request.
 	if r.Method != "GET" && primaryRegion != os.Getenv("FLY_REGION") {
-		w.Header().Set("fly-replay", fmt.Sprintf("region:"+primaryRegion))
+		log.Printf("redirecting to primary: %s", "region:"+primaryRegion)
+		w.Header().Set("fly-replay", "region="+primaryRegion)
 		return
 	}
 
 	// Otherwise, redirect to specified region.
 	region := r.URL.Query().Get("region")
 	if region != "" && region != os.Getenv("FLY_REGION") {
-		w.Header().Set("fly-replay", fmt.Sprintf("region:"+os.Getenv("FLY_REGION")))
+		log.Printf("redirecting to region: %s", "region:"+region)
+		w.Header().Set("fly-replay", "region="+region)
 		return
 	}
 

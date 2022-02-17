@@ -67,7 +67,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("set journal mode: %w", err)
 	} else if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, value INTEGER, timestamp TEXT)`); err != nil {
 		return fmt.Errorf("set journal mode: %w", err)
-	} else if _, err := db.Exec(`INSERT INTO t (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
+	} else if _, err := db.Exec(`INSERT INTO t (id, value, timestamp) VALUES (1, 0, '') ON CONFLICT (id) DO NOTHING`); err != nil {
 		return fmt.Errorf("set journal mode: %w", err)
 	}
 	defer db.Close()
@@ -100,9 +100,14 @@ func run(ctx context.Context) error {
 func monitor(ctx context.Context, db *sql.DB, watcher *fsnotify.Watcher) error {
 	for {
 		select {
+		case <-ctx.Done():
+			return nil
 		case event := <-watcher.Events:
 			if event.Op&fsnotify.Write == fsnotify.Write {
 				log.Printf("database file modified: %s", event.Name)
+
+				time.Sleep(1 * time.Millisecond)
+
 				if err := readDB(ctx, db); err != nil {
 					log.Printf("read db: %s", err)
 				}
@@ -154,3 +159,5 @@ type Region struct {
 	Code    string `json:"code"`
 	Primary bool   `json:"primary"`
 }
+
+var errNoChange = fmt.Errorf("no value change")

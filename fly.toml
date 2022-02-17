@@ -1,10 +1,14 @@
 app = "litestream-read-replica-demo"
 
 kill_signal = "SIGINT"
-kill_timeout = 5
+kill_timeout = 1
 processes = []
 
+[deploy]
+  strategy = "immediate"
+
 [env]
+  FLY_PRIMARY_REGION = "ord"
 
 [experimental]
   allowed_public_ports = []
