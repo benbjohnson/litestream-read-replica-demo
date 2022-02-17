@@ -32,9 +32,21 @@ var primaryRegion = "ord"
 
 var regions = []*Region{
 	{Code: "ord", Primary: true},
+	{Code: "ewr"},
+	{Code: "yyz"},
+	{Code: "dfw"},
+	{Code: "iad"},
+	{Code: "sea"},
 	{Code: "sjc"},
+	{Code: "lhr"},
 	{Code: "ams"},
+	{Code: "cdg"},
 	{Code: "nrt"},
+	{Code: "gru"},
+	{Code: "scl"},
+	{Code: "syd"},
+	{Code: "sin"},
+	{Code: "maa"},
 }
 
 func main() {
